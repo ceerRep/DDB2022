@@ -12,9 +12,18 @@ class ServerShell(cmd.Cmd):
         self.file = socket.create_connection((server, port))
 
     def default(self, line: str):
+        if line == 'EOF':
+            sys.exit(0)
+            
         self.file.send(line.encode('utf-8'))
-        output = self.file.recv(8192)
-        print(output.decode('utf-8'))
+        size = self.file.recv(4)
+        size = int.from_bytes(size, 'little')
+
+        buffer = b''
+        while len(buffer) < size:
+            buffer += self.file.recv(8192)
+
+        print(buffer.decode('utf-8'))
 
 
     def close(self):

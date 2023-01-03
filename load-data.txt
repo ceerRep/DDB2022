@@ -1,0 +1,4 @@
+import Book book.tsv
+import Customer customer.tsv
+import Orders orders.tsv
+import Publisher publisher.tsv

@@ -28,7 +28,8 @@ public:
                        return seastar::make_ready_future<
                            seastar::stop_iteration>(
                            seastar::stop_iteration::yes);
-                     return pengine->exec_sql(std::string(buf.get()))
+                     return pengine
+                         ->exec_sql(std::string(buf.get(), buf.size()))
                          .handle_exception_type(
                              [](std::exception &e)
                                  -> std::vector<std::vector<std::string>> {
@@ -38,16 +39,20 @@ public:
                            std::stringstream ss;
                            for (auto &&v1 : vals) {
                              for (auto &&v2 : v1)
-                               ss << v2 << ' ';
+                               ss << v2 << '\t';
                              ss << std::endl;
                            }
-                           ss << "DONE\n";
+                           ss << "DONE TOTAL " << vals.size() - 1 << " LINES\n";
 
                            auto str = ss.str();
 
+                           std::string str1(str.size() + 4, ' ');
+                           memcpy(str1.data() + 4, str.data(), str.size());
+                           *(int *)(str1.data()) = str.size();
+
                            return out
                                .write(seastar::temporary_buffer<char>(
-                                   str.c_str(), str.size()))
+                                   str1.data(), str1.size()))
                                .then([&out] { return out.flush(); })
                                .then(
                                    [] { return seastar::stop_iteration::no; });

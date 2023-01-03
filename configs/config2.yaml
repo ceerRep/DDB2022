@@ -20,3 +20,5 @@ nodes:
 sqlite:
   filename: 'node2.db'
   initfile: 'node2-init.sql'
+
+fragfile: frag.txt

@@ -13,6 +13,7 @@ struct AppConfig
 
   std::string sqldb_filename;
   std::string sqldb_initfile;
+  std::string frag_filename;
 };
 
 #endif

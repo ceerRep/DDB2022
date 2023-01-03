@@ -1,0 +1,17 @@
+createmeta t Publisher ON HFRAG where id:int name:str nation:str
+createmeta t Book ON HFRAG where id:int title:str authors:str publisher_id:int copies:int
+createmeta t Customer ON VFRAG where id:int name:str rank:int
+createmeta t Orders ON HFRAG where customer_id:int book_id:int quantity:int
+createmeta h node0.p1 on Publisher where id < 104000 AND nation='PRC'
+createmeta h node1.p2 on Publisher where id < 104000 AND nation='USA'
+createmeta h node2.p3 on Publisher where id >= 104000 AND nation='PRC'
+createmeta h node3.p4 on Publisher where id >= 104000 AND nation='USA'
+createmeta h node0.b1 on Book where id < 205000
+createmeta h node1.b2 on Book where id >= 205000 AND id < 210000
+createmeta h node2.b3 on Book where id >= 210000
+createmeta v node0.c1 on Customer where id name
+createmeta v node1.c2 on Customer where id rank
+createmeta h node0.o1 on Orders where customer_id < 307000 and book_id < 215000
+createmeta h node1.o2 on Orders where customer_id < 307000 and book_id >= 215000
+createmeta h node2.o3 on Orders where customer_id >= 307000 and book_id < 215000
+createmeta h node3.o4 on Orders where customer_id >= 307000 and book_id >= 215000

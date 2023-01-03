@@ -40,6 +40,7 @@ AppConfig &loadConfig(const char *filename) {
 
     appconfig->sqldb_filename = node["sqlite"]["filename"].as<std::string>();
     appconfig->sqldb_initfile = node["sqlite"]["initfile"].as<std::string>();
+    appconfig->frag_filename = node["fragfile"].as<std::string>();
   }
 
   return *appconfig;

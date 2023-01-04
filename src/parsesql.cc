@@ -1,3 +1,4 @@
+#include <boost/algorithm/string/join.hpp>
 #include <parsesql.hh>
 
 #include <fmt/format.h>
@@ -17,6 +18,7 @@
 #include <queue>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <typeinfo>
@@ -133,8 +135,10 @@ SelectStmt parseSelectStmt(std::string stmt, DatabaseMetadata *db) {
       }
 
     } else {
+      throw std::runtime_error("not select stastement");
     }
   } else {
+    throw std::runtime_error(result.errorMsg());
   }
 
   return ret;
@@ -192,7 +196,7 @@ void pushDownAndOptimize(BasicNode *now,
     selection->skipped = true;
     selection->disabled = selection->child->disabled;
   } else if (NJoinNode *njoin = dynamic_cast<NJoinNode *>(now)) {
-    bool disabled = true;
+    bool disabled = false;
 
     if (!njoin->change_all_table_name) {
       proj_cols->insert(njoin->join_column_names.begin(),
@@ -231,13 +235,11 @@ void pushDownAndOptimize(BasicNode *now,
         pushDownAndOptimize(child_projection, new_projs, new_conds, new_name);
 
         child_projection->skipped = true;
-        if (child_projection->column_names.size() == 1)
-          child_projection->disabled = true;
       }
     }
 
     for (auto &&child : njoin->join_children) {
-      disabled = disabled && child->disabled;
+      disabled = disabled || child->disabled;
     }
     njoin->disabled = disabled;
 
@@ -760,6 +762,7 @@ InsertStmt parseInsertStmt(std::string sql, DatabaseMetadata *db) {
       }
     }
   } else {
+    throw std::runtime_error(result.errorMsg());
   }
   return ret;
 }
@@ -795,6 +798,78 @@ dfs_join(std::string key,
   std::vector<std::string> now0{key};
   std::vector<std::vector<std::string> *> now{&now0};
   dfs_join_dfs(key, 0, now, sorted_results, ret);
+
+  return ret;
+}
+
+// createtable name colname1,attr1,... ... | createmetas ... | ...
+
+std::string buildCreateTableFromColumns(std::string tablename,
+                                        std::vector<std::string> info) {
+  std::stringstream sql_ss;
+  sql_ss << "create table " << tablename << " (";
+
+  std::vector<std::string> cols;
+
+  for (auto c : info) {
+    std::vector<std::string> tmp;
+    boost::split(tmp, c, boost::is_any_of(","));
+    cols.push_back(boost::algorithm::join(tmp, " "));
+  }
+  sql_ss << boost::algorithm::join(cols, ", ");
+  sql_ss << ");";
+
+  return sql_ss.str();
+}
+
+std::map<std::string, std::string>
+parseCreateTable(std::string create_sql, DatabaseMetadata *db,
+                 std::vector<std::string> *metas) {
+  std::vector<std::string> stmts;
+  std::vector<std::string> table_info_tokens;
+  std::map<std::string, std::string> ret;
+
+  boost::split(stmts, create_sql, boost::is_any_of("|"));
+
+  std::string table_info_stmt = stmts[0], create_frag = stmts[1];
+
+  boost::split(table_info_tokens, table_info_stmt, boost::is_any_of(" "));
+
+  // createmeta t
+
+  for (int i = 1; i < stmts.size(); i++) {
+    processCreateMeta(stmts[i], db);
+
+    if (metas)
+      metas->push_back(stmts[i]);
+  }
+
+  auto &&table_meta = db->tables[table_info_tokens[1]];
+  if (table_meta.frag_type == TableMetadata::HFRAG) {
+    std::vector<std::string> info(table_info_tokens.begin() + 2,
+                                  table_info_tokens.end());
+
+    for (auto &&[sname, sdata] : table_meta.hfrag_conds) {
+      auto &&[fname, data] = sdata;
+      ret[sname] = buildCreateTableFromColumns(fname, info);
+    }
+  } else {
+    for (auto &&[sname, sdata] : table_meta.vfrag_cols) {
+      auto &&[fname, vcols] = sdata;
+
+      std::vector<std::string> info;
+      std::set<std::string> vcols_set(vcols.begin(), vcols.end());
+
+      for (int i = 2; i < table_info_tokens.size(); i++) {
+        std::vector<std::string> tmp;
+        boost::split(tmp, table_info_tokens[i], boost::is_any_of(","));
+        if (vcols_set.count(tmp[0]))
+          info.push_back(table_info_tokens[i]);
+      }
+
+      ret[sname] = buildCreateTableFromColumns(fname, info);
+    }
+  }
 
   return ret;
 }

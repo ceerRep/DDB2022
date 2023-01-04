@@ -1,6 +1,7 @@
 #ifndef _RPC_ENGINE_HH
 #define _RPC_ENGINE_HH
 
+#include "SQLiteCpp/Database.h"
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/predicate.hpp>
@@ -33,8 +34,11 @@
 class SqlRpcEngine {
   using SqlFunc = std::vector<std::vector<std::string>>(std::string);
   using InsertFunc = int(std::string, std::vector<std::vector<std::string>>);
+  using ControlFunc = int(std::string, std::string);
   AppConfig &config;
-  std::unique_ptr<SQLite::Database> pdb;
+  std::shared_ptr<SQLite::Database> pdb;
+  std::map<std::string, std::shared_ptr<SQLite::Database>> db_conns;
+  std::map<std::string, std::shared_ptr<DatabaseMetadata>> db_metas;
   rpc::protocol<serializer> rpc_proto;
 
   std::unique_ptr<rpc::server> pserver;
@@ -43,45 +47,63 @@ class SqlRpcEngine {
   decltype(rpc_proto.register_handler(1, (SqlFunc *)nullptr)) rpc_sql_exec;
   decltype(rpc_proto.register_handler(1,
                                       (InsertFunc *)nullptr)) rpc_insert_exec;
+  decltype(rpc_proto.register_handler(1, (ControlFunc *)nullptr)) rpc_control;
 
-  DatabaseMetadata db_meta;
+  DatabaseMetadata *pdb_meta = nullptr;
 
-  enum { RPC_SQL_EXEC = 1, RPC_INSERT_DATA = 2 };
+  enum { RPC_SQL_EXEC = 1, RPC_INSERT_DATA = 2, RPC_CONTROL = 3 };
+
+  std::vector<std::string> sites;
 
 public:
   void init_db_meta() {
-    db_meta.sites =
-        std::vector<std::string>{"node0", "node1", "node2", "node3"};
-
     for (auto &&[sname, sconfig] : config.nodes) {
-      db_meta.sites.push_back(sname);
+      sites.push_back(sname);
     }
 
-    std::string line;
-    std::ifstream ifs(config.frag_filename);
-    while (std::getline(ifs, line)) {
-      if (line.size())
-        processCreateMeta(line, &db_meta);
+    // std::string line;
+    // std::ifstream ifs(config.frag_filename);
+    // while (std::getline(ifs, line)) {
+    //   if (line.size())
+    //     processCreateMeta(line, pdb_meta);
+    // }
+  }
+
+  void add_db_conn(std::string dbname) {
+    std::string filename = dbname + "_" + config.name + ".db";
+    std::cout << "add sqlite connection: " << filename << std::endl;
+
+    bool database_need_init = !std::filesystem::exists(filename);
+
+    auto new_db = std::make_shared<SQLite::Database>(
+        filename, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+    auto new_meta = std::make_shared<DatabaseMetadata>();
+
+    db_conns[dbname] = new_db;
+    db_metas[dbname] = new_meta;
+    new_meta->sites = sites;
+
+    if (database_need_init) {
+      SQLite::Transaction transaction(*new_db);
+      std::string line = "create table frags (text char(1024));";
+      std::cout << line << std::endl;
+      new_db->exec(line);
+      transaction.commit();
+    } else {
+      try {
+        SQLite::Statement query(*new_db, "select text from frags");
+
+        while (query.executeStep()) {
+          processCreateMeta(query.getColumn(0), new_meta.get());
+        }
+      } catch (std::exception &e) {
+        std::cout << e.what() << std::endl;
+      }
     }
   }
 
   SqlRpcEngine(AppConfig &config) : config(config), rpc_proto(serializer{}) {
     init_db_meta();
-    bool database_need_init = !std::filesystem::exists(config.sqldb_filename);
-
-    pdb = std::make_unique<SQLite::Database>(
-        config.sqldb_filename, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
-
-    if (database_need_init) {
-      SQLite::Transaction transaction(*pdb);
-      std::string line;
-      std::ifstream ifs(config.sqldb_initfile);
-      while (std::getline(ifs, line)) {
-        std::cout << line << std::endl;
-        pdb->exec(line);
-      }
-      transaction.commit();
-    }
 
     rpc_proto.register_handler(
         RPC_SQL_EXEC, [this](std::string sql) { return local_exec_sql(sql); });
@@ -91,6 +113,12 @@ public:
                                 std::vector<std::vector<std::string>> data) {
           return local_insert(tablename, data);
         });
+
+    rpc_proto.register_handler(RPC_CONTROL,
+                               [this](std::string cmd, std::string type) {
+                                 sql_control(cmd, type);
+                                 return 0;
+                               });
 
     pserver = std::make_unique<rpc::protocol<serializer>::server>(
         rpc_proto,
@@ -107,6 +135,7 @@ public:
                 RPC_SQL_EXEC);
 
     rpc_insert_exec = rpc_proto.make_client<InsertFunc>(RPC_INSERT_DATA);
+    rpc_control = rpc_proto.make_client<ControlFunc>(RPC_CONTROL);
 
     for (auto [name, info] : config.nodes) {
       pclients.emplace(std::make_pair(
@@ -137,9 +166,8 @@ public:
     return ret;
   }
 
-  seastar::future<int>
-  local_insert(std::string table_name,
-               std::vector<std::vector<std::string>> rows) {
+  int local_insert(std::string table_name,
+                   std::vector<std::vector<std::string>> rows) {
     std::stringstream sql_ss;
     sql_ss << "INSERT INTO " << table_name << " (";
     sql_ss << boost::algorithm::join(rows[0], ", ");
@@ -161,11 +189,21 @@ public:
     }
     transaction.commit();
 
-    return seastar::make_ready_future<int>(0);
+    return 0;
   }
 
   seastar::future<std::vector<std::vector<std::string>>>
   exec_query_node(BasicNode *node) {
+    if (node->disabled) {
+      if (auto projection = dynamic_cast<ProjectionNode *>(node)) {
+        return seastar::make_ready_future<
+            std::vector<std::vector<std::string>>>(
+            std::vector<std::vector<std::string>>{projection->column_names});
+      } else
+        return seastar::make_ready_future<
+            std::vector<std::vector<std::string>>>();
+    }
+
     if (auto projection = dynamic_cast<ProjectionNode *>(node)) {
       auto result = exec_query_node(projection->child.get()).get();
       std::vector<std::vector<std::string>> new_result;
@@ -321,7 +359,7 @@ public:
 
     } else if (auto readtable = dynamic_cast<ReadTableNode *>(node)) {
       auto [site, tablename] = split_column_name(readtable->table_name);
-      auto &&table_meta = db_meta.tables[readtable->orig_table_name];
+      auto &&table_meta = pdb_meta->tables[readtable->orig_table_name];
 
       std::stringstream sql_ss;
       sql_ss << "select "
@@ -397,19 +435,108 @@ public:
     auto msg = ss.str();
 
     return seastar::when_all(futures.begin(), futures.end())
-        .then([this, msg](auto) { return msg; });
+        .then([this, msg](auto futs) {
+          for (auto &&fut : futs)
+            fut.get();
+          return msg;
+        });
   }
 
   seastar::future<std::string> insert_from_file(std::string table,
                                                 std::string filename) {
-    auto insStmt = insertStmtFromTSV(table, filename, &db_meta);
-    auto site_ins_stmt = insertStmtToSites(insStmt, &db_meta);
+    auto insStmt = insertStmtFromTSV(table, filename, pdb_meta);
+    auto site_ins_stmt = insertStmtToSites(insStmt, pdb_meta);
 
     return exec_insert_sites(std::move(site_ins_stmt));
   }
 
+  void sql_control(std::string command, std::string type) {
+    std::cout << "Control cmd " << type << ' ' << command << std::endl;
+
+    if (type == "createdb") {
+      add_db_conn(command);
+    } else if (type == "usedb") {
+      if (db_conns.count(command) == 0)
+        add_db_conn(command);
+      pdb = db_conns[command];
+      pdb_meta = db_metas[command].get();
+    } else if (type == "createtable") {
+      std::vector<std::string> metas;
+      std::vector<std::vector<std::string>> rows;
+      auto sqls = parseCreateTable(command, pdb_meta, &metas);
+      rows.push_back({{"text"}});
+      for (auto meta : metas)
+        rows.push_back({{meta}});
+
+      local_insert("frags", rows);
+
+      if (sqls.count(config.name)) {
+        local_exec_sql(sqls[config.name]);
+      }
+    } else if (type == "close") {
+      if (config.name == command)
+        exit(0);
+    }
+  }
+
   seastar::future<std::vector<std::vector<std::string>>>
-  exec_sql(std::string sql) {
+  exec_sql_(std::string sql) {
+    if (boost::starts_with(sql, "createdb")) {
+      std::vector<std::string> tokens;
+      boost::split(tokens, sql, boost::is_any_of(" \t;"));
+
+      std::vector<seastar::future<int>> futs_int;
+      for (auto sname : sites) {
+        futs_int.emplace_back(
+            std::move(rpc_control(*pclients[sname], tokens[1], "createdb")));
+      }
+
+      return seastar::when_all(futs_int.begin(), futs_int.end())
+          .then([](auto futs) -> std::vector<std::vector<std::string>> {
+            for (auto &&fut : futs)
+              fut.get();
+            return {{"created"}};
+          });
+    } else if (boost::starts_with(sql, "usedb")) {
+      std::vector<std::string> tokens;
+      boost::split(tokens, sql, boost::is_any_of(" \t;"));
+
+      std::vector<seastar::future<int>> futs_int;
+      for (auto sname : sites) {
+        futs_int.emplace_back(
+            std::move(rpc_control(*pclients[sname], tokens[1], "usedb")));
+      }
+
+      return seastar::when_all(futs_int.begin(), futs_int.end())
+          .then([](auto futs) -> std::vector<std::vector<std::string>> {
+            for (auto &&fut : futs)
+              fut.get();
+            return {{"changed"}};
+          });
+    } else if (boost::starts_with(sql, "close")) {
+      std::vector<std::string> tokens;
+      boost::split(tokens, sql, boost::is_any_of(" \t;"));
+
+      std::vector<seastar::future<int>> futs_int;
+      for (auto sname : sites) {
+        futs_int.emplace_back(
+            std::move(rpc_control(*pclients[sname], tokens[1], "close")));
+      }
+
+      return seastar::when_all(futs_int.begin(), futs_int.end())
+          .then([](auto futs) -> std::vector<std::vector<std::string>> {
+            for (auto &&fut : futs)
+              fut.get();
+            return {{"closed"}};
+          });
+    }
+
+    if (pdb == nullptr) {
+      return seastar::make_ready_future<>().then(
+          []() -> std::vector<std::vector<std::string>> {
+            return {{"no database selected"}};
+          });
+    }
 
     if (boost::starts_with(sql, "import")) {
       std::vector<std::string> tokens;
@@ -420,8 +547,8 @@ public:
             return {{s}};
           });
     } else if (boost::starts_with(sql, "insert")) {
-      auto insert = parseInsertStmt(sql, &db_meta);
-      auto sites = insertStmtToSites(insert, &db_meta);
+      auto insert = parseInsertStmt(sql, pdb_meta);
+      auto sites = insertStmtToSites(insert, pdb_meta);
 
       return exec_insert_sites(std::move(sites))
           .then([](std::string s) -> std::vector<std::vector<std::string>> {
@@ -435,26 +562,41 @@ public:
 
       std::vector<seastar::future<std::vector<std::vector<std::string>>>> futs;
 
-      for (auto &&[sname, sdata] : db_meta.tables[tablename].hfrag_conds) {
+      for (auto &&[sname, sdata] : pdb_meta->tables[tablename].hfrag_conds) {
         auto &&[fname, data] = sdata;
         futs.emplace_back(
             std::move(rpc_sql_exec(*pclients[sname], "delete from " + fname)));
       }
 
-      for (auto &&[sname, sdata] : db_meta.tables[tablename].vfrag_cols) {
+      for (auto &&[sname, sdata] : pdb_meta->tables[tablename].vfrag_cols) {
         auto &&[fname, data] = sdata;
         futs.emplace_back(
             std::move(rpc_sql_exec(*pclients[sname], "delete from " + fname)));
       }
 
       return seastar::when_all(futs.begin(), futs.end())
-          .then([](auto) -> std::vector<std::vector<std::string>> {
+          .then([](auto futs) -> std::vector<std::vector<std::string>> {
+            for (auto &&fut : futs)
+              fut.get();
             return {{"deleted"}};
+          });
+    } else if (boost::starts_with(sql, "createtable")) {
+      std::vector<seastar::future<int>> futs_int;
+      for (auto sname : sites) {
+        futs_int.emplace_back(
+            std::move(rpc_control(*pclients[sname], sql, "createtable")));
+      }
+
+      return seastar::when_all(futs_int.begin(), futs_int.end())
+          .then([](auto futs) -> std::vector<std::vector<std::string>> {
+            for (auto &&fut : futs)
+              fut.get();
+            return {{"created"}};
           });
     }
 
-    auto result = parseSelectStmt(sql, &db_meta);
-    auto node = buildRawNodeTreeFromSelectStmt(result, &db_meta);
+    auto result = parseSelectStmt(sql, pdb_meta);
+    auto node = buildRawNodeTreeFromSelectStmt(result, pdb_meta);
     pushDownAndOptimize(node.get(), {}, {}, "");
     auto copy = node->copy();
 
@@ -465,6 +607,43 @@ public:
       std::cout << copy->to_string() << std::endl;
       return ret;
     });
+  }
+
+  seastar::future<std::vector<std::vector<std::string>>>
+  exec_sql(std::string sql) {
+    return seastar::make_ready_future<>()
+        .then([this, sql]() {
+          std::vector<std::string> closed_clients;
+          for (auto &&[sname, client] : pclients) {
+            if (client->error()) {
+              closed_clients.push_back(sname);
+            }
+          }
+
+          for (auto sname : closed_clients) {
+            std::cout << "reconnecting " << sname << std::endl;
+            pclients.erase(sname);
+            pclients.emplace(std::make_pair(
+                sname,
+                std::make_unique<rpc::protocol<serializer>::client>(
+                    rpc_proto, ipv4_addr{std::get<0>(config.nodes[sname]),
+                                         std::get<1>(config.nodes[sname])})));
+          }
+
+          return exec_sql_(sql);
+        })
+        .handle_exception_type([this](seastar::rpc::closed_error &e)
+                                   -> std::vector<std::vector<std::string>> {
+          for (auto &&[sname, client] : pclients) {
+            if (client->error())
+              return {{"connection from " + sname + " closed"}};
+          }
+          return {{e.what()}};
+        })
+        .handle_exception_type(
+            [this](std::exception &e) -> std::vector<std::vector<std::string>> {
+              return {{e.what()}};
+            });
   }
 };
 

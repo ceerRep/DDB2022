@@ -2,6 +2,7 @@
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/constants.hpp>
+#include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <cstddef>
 #include <deque>
@@ -33,16 +34,15 @@
 #include "hsql/util/sqlhelper.h"
 
 int main(void) {
-  const std::string query =
+  const std::string query1 =
       "select Customer.name, Book.title, Publisher.name, Orders.quantity from "
       "Customer,Book,Publisher,Orders where Customer.id=Orders.customer_id and "
       "Book.id=Orders.book_id and Book.publisher_id=Publisher.id and "
       "Book.id>210000 and Publisher.nation='PRC' and Orders.customer_id >= "
       "307000 and Orders.book_id < 215000;";
-  const std::string query1 =
-      "select Book.title, Book.copies, Publisher.name, Publisher.nation from "
-      "Book,Publisher where Book.publisher_id=Publisher.id and "
-      "Publisher.nation='PRC'and Book.copies>1000;";
+  const std::string query =
+      "select Orders.quantity from Orders,Customer where Orders.customer_id = "
+      "Customer.id and Customer.id = 300001 and Customer.id = 300002";
   // const std::string query = "select b, c, d from a1, a2 where a1.id = a2.id "
   //                           "and  a1.id = a2.id and  a1.id = a2.id";
 

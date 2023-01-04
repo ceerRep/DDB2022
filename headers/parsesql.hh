@@ -294,16 +294,29 @@ struct NJoinNode : public BasicNode {
 
   virtual std::shared_ptr<BasicNode> copy() override {
     int child_num = 0;
-    std::shared_ptr<BasicNode> last_enabled_child;
+    std::shared_ptr<BasicNode> last_enabled_child = join_children[0];
 
     for (auto &&child : join_children) {
-      if (!child->disabled) {
+      bool useful = true;
+
+      if (child->disabled) {
+        useful = false;
+      }
+
+      if (change_all_table_name) {
+        auto child_projection = dynamic_cast<ProjectionNode *>(child.get());
+        if (child_projection->column_names.size() <= 1) {
+          useful = false;
+        }
+      }
+
+      if (useful) {
         child_num++;
         last_enabled_child = child;
       }
     }
 
-    if (child_num == 1) {
+    if (child_num <= 1) {
       auto child_copy = last_enabled_child->copy();
       if (change_all_table_name) {
         auto rename = std::make_shared<RenameNode>();
@@ -321,9 +334,11 @@ struct NJoinNode : public BasicNode {
       join->change_all_table_name = change_all_table_name;
 
       for (auto &&child : join_children) {
-        if (!child->disabled) {
+        if (change_all_table_name &&
+            dynamic_cast<ProjectionNode *>(child.get())->column_names.size() <=
+                1) {
+        } else
           join->join_children.push_back(child->copy());
-        }
       }
 
       return join;
@@ -439,4 +454,7 @@ dfs_join(std::string key,
          std::vector<std::multimap<std::string, std::vector<std::string>>>
              &sorted_results);
 
+std::map<std::string, std::string>
+parseCreateTable(std::string create_sql, DatabaseMetadata *db,
+                 std::vector<std::string> *metas);
 #endif

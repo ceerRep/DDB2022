@@ -1,6 +1,7 @@
 #include <chrono>
 #include <iostream>
 
+#include <seastar/core/idle_cpu_handler.hh>
 #include <yaml-cpp/yaml.h>
 
 #include <seastar/core/app-template.hh>

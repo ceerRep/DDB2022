@@ -1,6 +1,7 @@
 import cmd, sys
 import socket
 import readline
+import time
 
 class ServerShell(cmd.Cmd):
     intro = 'Welcome to the server.\n'
@@ -14,7 +15,8 @@ class ServerShell(cmd.Cmd):
     def default(self, line: str):
         if line == 'EOF':
             sys.exit(0)
-            
+        
+        start = time.time()
         self.file.send(line.encode('utf-8'))
         size = self.file.recv(4)
         size = int.from_bytes(size, 'little')
@@ -22,8 +24,10 @@ class ServerShell(cmd.Cmd):
         buffer = b''
         while len(buffer) < size:
             buffer += self.file.recv(8192)
+        end = time.time()
 
         print(buffer.decode('utf-8'))
+        print("Time elapsed:", end - start, "seconds")
 
 
     def close(self):

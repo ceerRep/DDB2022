@@ -26,9 +26,9 @@
 
 std::string format_column_name(std::string table, std::string column) {
   if (table.size())
-    return table + "." + column;
+    return table + "." + boost::to_lower_copy(column);
   else
-    return column;
+    return boost::to_lower_copy(column);
 }
 
 std::tuple<std::string, std::string> split_column_name(std::string column) {

@@ -150,7 +150,7 @@ SelectStmt parseSelectStmt(std::string stmt, DatabaseMetadata *db) {
 void pushDownAndOptimize(BasicNode *now,
                          std::optional<std::set<std::string>> proj_cols,
                          std::vector<CompareConds> sel_conds,
-                         std::string single_table_name) {
+                         std::string single_table_name, DatabaseMetadata *db) {
   if (ProjectionNode *projection = dynamic_cast<ProjectionNode *>(now)) {
 
     if (!proj_cols) {
@@ -184,7 +184,7 @@ void pushDownAndOptimize(BasicNode *now,
     projection->column_names =
         std::vector<std::string>(proj_cols->begin(), proj_cols->end());
     pushDownAndOptimize(projection->child.get(), proj_cols, sel_conds,
-                        single_table_name);
+                        single_table_name, db);
     projection->disabled = projection->child->disabled;
   } else if (SelectionNode *selection = dynamic_cast<SelectionNode *>(now)) {
     std::vector<CompareConds> new_conds = selection->conds;
@@ -192,7 +192,7 @@ void pushDownAndOptimize(BasicNode *now,
     selection->conds = new_conds;
     sel_conds = new_conds;
     pushDownAndOptimize(selection->child.get(), proj_cols, sel_conds,
-                        single_table_name);
+                        single_table_name, db);
     selection->skipped = true;
     selection->disabled = selection->child->disabled;
   } else if (NJoinNode *njoin = dynamic_cast<NJoinNode *>(now)) {
@@ -203,7 +203,7 @@ void pushDownAndOptimize(BasicNode *now,
                         njoin->join_column_names.end());
       for (auto &&child : njoin->join_children) {
         pushDownAndOptimize(child.get(), proj_cols, sel_conds,
-                            single_table_name);
+                            single_table_name, db);
       }
     } else {
       auto now_name = njoin->change_all_table_name;
@@ -232,7 +232,8 @@ void pushDownAndOptimize(BasicNode *now,
                 {format_column_name(new_name, c1), cond.op, cond.val2});
         }
 
-        pushDownAndOptimize(child_projection, new_projs, new_conds, new_name);
+        pushDownAndOptimize(child_projection, new_projs, new_conds, new_name,
+                            db);
 
         child_projection->skipped = true;
       }
@@ -268,7 +269,7 @@ void pushDownAndOptimize(BasicNode *now,
               {format_column_name(new_name, c1), cond.op, cond.val2});
       }
 
-      pushDownAndOptimize(child_projection, new_projs, new_conds, new_name);
+      pushDownAndOptimize(child_projection, new_projs, new_conds, new_name, db);
       child_projection->skipped = true;
       disabled = disabled && child_projection->disabled;
     }
@@ -277,7 +278,29 @@ void pushDownAndOptimize(BasicNode *now,
   } else if (ReadTableNode *rtable = dynamic_cast<ReadTableNode *>(now)) {
     rtable->column_names.insert(rtable->column_names.end(), proj_cols->begin(),
                                 proj_cols->end());
-    rtable->select_conds = sel_conds;
+
+    auto &&table_info = db->tables[rtable->orig_table_name];
+    if (table_info.frag_type == TableMetadata::VFRAG) {
+      rtable->select_conds.clear();
+
+      auto [sname, fname] = split_column_name(rtable->table_name);
+
+      std::set<std::string> cols;
+
+      auto &&[fn, colnames] = table_info.vfrag_cols[sname];
+
+      for (auto cname : colnames) {
+        cols.insert(std::get<1>(split_column_name(cname)));
+      }
+
+      for (auto cond : sel_conds) {
+        auto [tb, cname] = split_column_name(cond.val1);
+        if (cols.count(cname))
+          rtable->select_conds.push_back(cond);
+      }
+    }
+    else
+      rtable->select_conds = sel_conds;
 
     // check conditions
     for (auto cond1 : sel_conds)
@@ -485,6 +508,7 @@ std::shared_ptr<BasicNode> buildDistributedReadNode(std::string tablename,
       auto sel = std::make_shared<SelectionNode>();
       auto read = std::make_shared<ReadTableNode>();
       proj->child = sel;
+      proj->read_node = read.get();
       sel->child = read;
       read->table_name = sname + "." + fname;
       read->orig_table_name = tablename;
@@ -509,6 +533,7 @@ std::shared_ptr<BasicNode> buildDistributedReadNode(std::string tablename,
       }
       auto read = std::make_shared<ReadTableNode>();
       proj->child = sel;
+      proj->read_node = read.get();
       sel->child = read;
       read->table_name = sname + "." + fname;
       read->orig_table_name = tablename;

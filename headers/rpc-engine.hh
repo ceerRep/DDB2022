@@ -597,8 +597,8 @@ public:
 
     auto result = parseSelectStmt(sql, pdb_meta);
     auto node = buildRawNodeTreeFromSelectStmt(result, pdb_meta);
-    pushDownAndOptimize(node.get(), {}, {}, "");
-    auto copy = node->copy();
+    pushDownAndOptimize(node.get(), {}, {}, "", pdb_meta);
+    auto copy = node->copy(pdb_meta);
 
     std::cout << copy->to_string() << std::endl;
 

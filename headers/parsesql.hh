@@ -14,6 +14,9 @@
 
 #include "hsql/SQLParser.h"
 
+std::string format_column_name(std::string table, std::string column);
+std::tuple<std::string, std::string> split_column_name(std::string column);
+
 enum class CompareOps {
   EQ = hsql::kOpEquals,
   LE = hsql::kOpLessEq,
@@ -92,13 +95,17 @@ struct BasicNode {
 
   virtual ~BasicNode() = default;
   virtual std::string to_string(int prefix = 0) = 0;
-  virtual std::shared_ptr<BasicNode> copy() = 0;
+  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) = 0;
 };
+
+struct ReadTableNode;
 
 struct ProjectionNode : public BasicNode {
   std::vector<std::string> column_names;
 
   std::shared_ptr<BasicNode> child;
+
+  ReadTableNode *read_node = nullptr;
 
   virtual std::string to_string(int prefix = 0) override {
     std::stringstream ss;
@@ -123,15 +130,15 @@ struct ProjectionNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy() override {
+  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
     if (skipped)
-      return child->copy();
+      return child->copy(db_meta);
     else {
       auto proj = std::make_shared<ProjectionNode>();
       proj->column_names = column_names;
       proj->disabled = disabled;
       proj->skipped = skipped;
-      proj->child = child->copy();
+      proj->child = child->copy(db_meta);
 
       return proj;
     }
@@ -171,15 +178,15 @@ struct SelectionNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy() override {
+  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
     if (skipped) {
-      return child->copy();
+      return child->copy(db_meta);
     } else {
       auto sel = std::make_shared<SelectionNode>();
       sel->disabled = disabled;
       sel->skipped = skipped;
       sel->conds = conds;
-      sel->child = child->copy();
+      sel->child = child->copy(db_meta);
 
       return sel;
     }
@@ -209,7 +216,9 @@ struct RenameNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy() override { return nullptr; }
+  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
+    return nullptr;
+  }
 };
 
 struct ReadTableNode : public BasicNode {
@@ -252,7 +261,7 @@ struct ReadTableNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy() override {
+  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *) override {
     return std::make_shared<ReadTableNode>(*this);
   }
 };
@@ -292,7 +301,7 @@ struct NJoinNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy() override {
+  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
     int child_num = 0;
     std::shared_ptr<BasicNode> last_enabled_child = join_children[0];
 
@@ -305,7 +314,8 @@ struct NJoinNode : public BasicNode {
 
       if (change_all_table_name) {
         auto child_projection = dynamic_cast<ProjectionNode *>(child.get());
-        if (child_projection->column_names.size() <= 1) {
+        if (child_projection->column_names.size() <= 1 &&
+            child_projection->read_node->select_conds.size() == 0) {
           useful = false;
         }
       }
@@ -317,7 +327,7 @@ struct NJoinNode : public BasicNode {
     }
 
     if (child_num <= 1) {
-      auto child_copy = last_enabled_child->copy();
+      auto child_copy = last_enabled_child->copy(db_meta);
       if (change_all_table_name) {
         auto rename = std::make_shared<RenameNode>();
         rename->child = child_copy;
@@ -334,11 +344,11 @@ struct NJoinNode : public BasicNode {
       join->change_all_table_name = change_all_table_name;
 
       for (auto &&child : join_children) {
-        if (change_all_table_name &&
-            dynamic_cast<ProjectionNode *>(child.get())->column_names.size() <=
-                1) {
+        auto child_proj = dynamic_cast<ProjectionNode *>(child.get());
+        if (change_all_table_name && child_proj->column_names.size() <= 1 &&
+            child_proj->read_node->select_conds.size() == 0) {
         } else
-          join->join_children.push_back(child->copy());
+          join->join_children.push_back(child->copy(db_meta));
       }
 
       return join;
@@ -377,7 +387,7 @@ struct UnionNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy() override {
+  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
     int child_num = 0;
     std::shared_ptr<BasicNode> last_enabled_child;
 
@@ -389,7 +399,7 @@ struct UnionNode : public BasicNode {
     }
 
     if (child_num == 1) {
-      auto child_copy = last_enabled_child->copy();
+      auto child_copy = last_enabled_child->copy(db_meta);
       if (change_all_table_name) {
         auto rename = std::make_shared<RenameNode>();
         rename->child = child_copy;
@@ -407,7 +417,7 @@ struct UnionNode : public BasicNode {
 
       for (auto &&child : union_children) {
         if (!child->disabled) {
-          union_node->union_children.push_back(child->copy());
+          union_node->union_children.push_back(child->copy(db_meta));
         }
       }
 
@@ -416,15 +426,13 @@ struct UnionNode : public BasicNode {
   }
 };
 
-std::string format_column_name(std::string table, std::string column);
-std::tuple<std::string, std::string> split_column_name(std::string column);
 std::optional<CompareConds> processCond(hsql::Expr *expr,
                                         std::string default_table_name);
 SelectStmt parseSelectStmt(std::string stmt, DatabaseMetadata *db);
 void pushDownAndOptimize(BasicNode *now,
                          std::optional<std::set<std::string>> proj_cols,
                          std::vector<CompareConds> sel_conds,
-                         std::string single_table_name);
+                         std::string single_table_name, DatabaseMetadata *db);
 void processCreateMeta(std::string create_frag_stmt, DatabaseMetadata *db);
 void printSelectStmt(SelectStmt result);
 std::shared_ptr<BasicNode> buildDistributedReadNode(std::string tablename,
@@ -457,4 +465,5 @@ dfs_join(std::string key,
 std::map<std::string, std::string>
 parseCreateTable(std::string create_sql, DatabaseMetadata *db,
                  std::vector<std::string> *metas);
+
 #endif

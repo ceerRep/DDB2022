@@ -41,8 +41,10 @@ int main(void) {
       "Book.id>210000 and Publisher.nation='PRC' and Orders.customer_id >= "
       "307000 and Orders.book_id < 215000;";
   const std::string query =
-      "select Orders.quantity from Orders,Customer where Orders.customer_id = "
-      "Customer.id and Customer.id = 300001 and Customer.id = 300002";
+      "select Orders.customer_id, Orders.book_id, Orders.quantity from Orders, "
+      "Customer, Book where Orders.customer_id=Customer.id and "
+      "Orders.book_id=Book.id and Customer.rank=3 and Book.copies<10 and "
+      "Orders.quantity<10;";
   // const std::string query = "select b, c, d from a1, a2 where a1.id = a2.id "
   //                           "and  a1.id = a2.id and  a1.id = a2.id";
 
@@ -93,17 +95,21 @@ int main(void) {
                     "307000 and book_id >= 215000",
                     &db);
 
-  auto result = parseSelectStmt(query, &db);
-  printSelectStmt(result);
+  std::string line;
 
-  auto node = buildRawNodeTreeFromSelectStmt(result, &db);
-  std::cout << node->to_string() << std::endl;
+  while (std::getline(std::cin, line)) {
+    auto result = parseSelectStmt(line, &db);
+    printSelectStmt(result);
 
-  pushDownAndOptimize(node.get(), {}, {}, "");
-  std::cout << node->to_string() << std::endl;
+    auto node = buildRawNodeTreeFromSelectStmt(result, &db);
+    std::cout << node->to_string() << std::endl;
 
-  auto copy = node->copy();
-  std::cout << copy->to_string() << std::endl;
+    pushDownAndOptimize(node.get(), {}, {}, "", &db);
+    std::cout << node->to_string() << std::endl;
+
+    auto copy = node->copy(&db);
+    std::cout << copy->to_string() << std::endl;
+  }
 
   // auto insert = insertStmtFromTSV("Publisher", "publisher.tsv", &db);
   // std::cout << insert.values.size() << std::endl;

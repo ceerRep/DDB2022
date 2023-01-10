@@ -89,13 +89,18 @@ struct DeleteStmt {
 struct BasicNode {
   //   BasicNode *parent;
   int result = 0;
+  int array_index = 0;
+  std::string exec_on_site;
 
   bool skipped = false;
   bool disabled = false;
 
   virtual ~BasicNode() = default;
   virtual std::string to_string(int prefix = 0) = 0;
-  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) = 0;
+  virtual std::shared_ptr<BasicNode>
+  copy(DatabaseMetadata *db_meta,
+       std::vector<std::shared_ptr<BasicNode>> &nodes) = 0;
+  virtual void optimizeExecNode(DatabaseMetadata *db_meta) = 0;
 };
 
 struct ReadTableNode;
@@ -122,6 +127,8 @@ struct ProjectionNode : public BasicNode {
     if (disabled)
       ss << " DISABLED";
 
+    ss << ' ' << exec_on_site << ' ' << array_index;
+
     ss << " " << result;
 
     ss << '\n';
@@ -130,18 +137,30 @@ struct ProjectionNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
+  virtual std::shared_ptr<BasicNode>
+  copy(DatabaseMetadata *db_meta,
+       std::vector<std::shared_ptr<BasicNode>> &nodes) override {
     if (skipped)
-      return child->copy(db_meta);
+      return child->copy(db_meta, nodes);
     else {
       auto proj = std::make_shared<ProjectionNode>();
+
+      nodes.push_back(proj);
+      proj->array_index = nodes.size() - 1;
+
       proj->column_names = column_names;
       proj->disabled = disabled;
       proj->skipped = skipped;
-      proj->child = child->copy(db_meta);
+      proj->child = child->copy(db_meta, nodes);
 
       return proj;
     }
+  }
+
+  virtual void optimizeExecNode(DatabaseMetadata *db_meta) override
+  {
+    child->optimizeExecNode(db_meta);
+    exec_on_site = child->exec_on_site;
   }
 };
 
@@ -170,6 +189,8 @@ struct SelectionNode : public BasicNode {
     if (disabled)
       ss << " DISABLED";
 
+    ss << ' ' << exec_on_site << ' ' << array_index;
+
     ss << " " << result;
 
     ss << '\n';
@@ -178,18 +199,30 @@ struct SelectionNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
+  virtual std::shared_ptr<BasicNode>
+  copy(DatabaseMetadata *db_meta,
+       std::vector<std::shared_ptr<BasicNode>> &nodes) override {
     if (skipped) {
-      return child->copy(db_meta);
+      return child->copy(db_meta, nodes);
     } else {
       auto sel = std::make_shared<SelectionNode>();
+
+      nodes.push_back(sel);
+      sel->array_index = nodes.size() - 1;
+
       sel->disabled = disabled;
       sel->skipped = skipped;
       sel->conds = conds;
-      sel->child = child->copy(db_meta);
+      sel->child = child->copy(db_meta, nodes);
 
       return sel;
     }
+  }
+
+  virtual void optimizeExecNode(DatabaseMetadata *db_meta) override
+  {
+    child->optimizeExecNode(db_meta);
+    exec_on_site = child->exec_on_site; 
   }
 };
 
@@ -208,6 +241,8 @@ struct RenameNode : public BasicNode {
     if (disabled)
       ss << " DISABLED";
 
+    ss << ' ' << exec_on_site << ' ' << array_index;
+
     ss << " " << result;
 
     ss << '\n';
@@ -216,8 +251,16 @@ struct RenameNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
+  virtual std::shared_ptr<BasicNode>
+  copy(DatabaseMetadata *db_meta,
+       std::vector<std::shared_ptr<BasicNode>> &nodes) override {
     return nullptr;
+  }
+
+  virtual void optimizeExecNode(DatabaseMetadata *db_meta) override
+  {
+    child->optimizeExecNode(db_meta); 
+    exec_on_site = child->exec_on_site;
   }
 };
 
@@ -256,13 +299,27 @@ struct ReadTableNode : public BasicNode {
     if (disabled)
       ss << " DISABLED";
 
+    ss << ' ' << exec_on_site << ' ' << array_index;
+
     ss << " " << result;
 
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *) override {
-    return std::make_shared<ReadTableNode>(*this);
+  virtual std::shared_ptr<BasicNode>
+  copy(DatabaseMetadata *db_meta,
+       std::vector<std::shared_ptr<BasicNode>> &nodes) override {
+    auto ret = std::make_shared<ReadTableNode>(*this);
+
+    nodes.push_back(ret);
+    ret->array_index = nodes.size() - 1;
+
+    return ret;
+  }
+
+  virtual void optimizeExecNode(DatabaseMetadata *db_meta) override
+  {
+    exec_on_site = std::get<0>(split_column_name(table_name));
   }
 };
 
@@ -287,6 +344,8 @@ struct NJoinNode : public BasicNode {
     if (disabled)
       ss << " DISABLED";
 
+    ss << ' ' << exec_on_site << ' ' << array_index;
+
     ss << " " << result;
 
     if (change_all_table_name) {
@@ -301,7 +360,9 @@ struct NJoinNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
+  virtual std::shared_ptr<BasicNode>
+  copy(DatabaseMetadata *db_meta,
+       std::vector<std::shared_ptr<BasicNode>> &nodes) override {
     int child_num = 0;
     std::shared_ptr<BasicNode> last_enabled_child = join_children[0];
 
@@ -327,9 +388,13 @@ struct NJoinNode : public BasicNode {
     }
 
     if (child_num <= 1) {
-      auto child_copy = last_enabled_child->copy(db_meta);
+      auto child_copy = last_enabled_child->copy(db_meta, nodes);
       if (change_all_table_name) {
         auto rename = std::make_shared<RenameNode>();
+
+        nodes.push_back(rename);
+        rename->array_index = nodes.size() - 1;
+
         rename->child = child_copy;
         rename->table_name = *change_all_table_name;
 
@@ -338,6 +403,10 @@ struct NJoinNode : public BasicNode {
         return child_copy;
     } else {
       auto join = std::make_shared<NJoinNode>();
+
+      nodes.push_back(join);
+      join->array_index = nodes.size() - 1;
+
       join->join_column_names = join_column_names;
       join->disabled = disabled;
       join->skipped = skipped;
@@ -348,11 +417,25 @@ struct NJoinNode : public BasicNode {
         if (change_all_table_name && child_proj->column_names.size() <= 1 &&
             child_proj->read_node->select_conds.size() == 0) {
         } else
-          join->join_children.push_back(child->copy(db_meta));
+          join->join_children.push_back(child->copy(db_meta, nodes));
       }
 
       return join;
     }
+  }
+
+  virtual void optimizeExecNode(DatabaseMetadata *db_meta) override
+  {
+    bool mark = true;
+
+    for (auto &&child : join_children)
+    {
+      child->optimizeExecNode(db_meta);
+      mark = mark && (child->exec_on_site == join_children[0]->exec_on_site);
+    }
+
+    if (mark)
+      exec_on_site = join_children[0]->exec_on_site;
   }
 };
 
@@ -373,6 +456,8 @@ struct UnionNode : public BasicNode {
     if (disabled)
       ss << " DISABLED";
 
+    ss << ' ' << exec_on_site << ' ' << array_index;
+
     ss << " " << result;
 
     if (change_all_table_name) {
@@ -387,7 +472,9 @@ struct UnionNode : public BasicNode {
     return ss.str();
   }
 
-  virtual std::shared_ptr<BasicNode> copy(DatabaseMetadata *db_meta) override {
+  virtual std::shared_ptr<BasicNode>
+  copy(DatabaseMetadata *db_meta,
+       std::vector<std::shared_ptr<BasicNode>> &nodes) override {
     int child_num = 0;
     std::shared_ptr<BasicNode> last_enabled_child;
 
@@ -399,9 +486,13 @@ struct UnionNode : public BasicNode {
     }
 
     if (child_num == 1) {
-      auto child_copy = last_enabled_child->copy(db_meta);
+      auto child_copy = last_enabled_child->copy(db_meta, nodes);
       if (change_all_table_name) {
         auto rename = std::make_shared<RenameNode>();
+
+        nodes.push_back(rename);
+        rename->array_index = nodes.size() - 1;
+
         rename->child = child_copy;
         rename->table_name = *change_all_table_name;
 
@@ -411,18 +502,35 @@ struct UnionNode : public BasicNode {
     } else {
       auto union_node = std::make_shared<UnionNode>();
 
+      nodes.push_back(union_node);
+      union_node->array_index = nodes.size() - 1;
+
       union_node->disabled = disabled;
       union_node->skipped = skipped;
       union_node->change_all_table_name = change_all_table_name;
 
       for (auto &&child : union_children) {
         if (!child->disabled) {
-          union_node->union_children.push_back(child->copy(db_meta));
+          union_node->union_children.push_back(child->copy(db_meta, nodes));
         }
       }
 
       return union_node;
     }
+  }
+
+  virtual void optimizeExecNode(DatabaseMetadata *db_meta) override
+  {
+    bool mark = true;
+
+    for (auto &&child : union_children)
+    {
+      child->optimizeExecNode(db_meta);
+      mark = mark && (child->exec_on_site == union_children[0]->exec_on_site);
+    }
+
+    if (mark)
+      exec_on_site = union_children[0]->exec_on_site;
   }
 };
 

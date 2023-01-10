@@ -4,6 +4,7 @@
 #include <boost/algorithm/string/constants.hpp>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include <cassert>
 #include <cstddef>
 #include <deque>
 #include <fmt/format.h>
@@ -107,8 +108,14 @@ int main(void) {
     pushDownAndOptimize(node.get(), {}, {}, "", &db);
     std::cout << node->to_string() << std::endl;
 
-    auto copy = node->copy(&db);
+    std::vector<std::shared_ptr<BasicNode>> nodes;
+    auto copy = node->copy(&db, nodes);
+    copy->optimizeExecNode(&db);
     std::cout << copy->to_string() << std::endl;
+
+    for (auto &&node : nodes) {
+      assert(&nodes[node->array_index] == node);
+    }
   }
 
   // auto insert = insertStmtFromTSV("Publisher", "publisher.tsv", &db);

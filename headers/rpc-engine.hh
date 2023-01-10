@@ -35,6 +35,8 @@ class SqlRpcEngine {
   using SqlFunc = std::vector<std::vector<std::string>>(std::string);
   using InsertFunc = int(std::string, std::vector<std::vector<std::string>>);
   using ControlFunc = int(std::string, std::string);
+  using RemoteNodeFunc = std::vector<std::vector<std::string>>(std::string,
+                                                               int);
   AppConfig &config;
   std::shared_ptr<SQLite::Database> pdb;
   std::map<std::string, std::shared_ptr<SQLite::Database>> db_conns;
@@ -48,10 +50,17 @@ class SqlRpcEngine {
   decltype(rpc_proto.register_handler(1,
                                       (InsertFunc *)nullptr)) rpc_insert_exec;
   decltype(rpc_proto.register_handler(1, (ControlFunc *)nullptr)) rpc_control;
+  decltype(rpc_proto.register_handler(
+      1, (RemoteNodeFunc *)nullptr)) rpc_remotenode;
 
   DatabaseMetadata *pdb_meta = nullptr;
 
-  enum { RPC_SQL_EXEC = 1, RPC_INSERT_DATA = 2, RPC_CONTROL = 3 };
+  enum {
+    RPC_SQL_EXEC = 1,
+    RPC_INSERT_DATA = 2,
+    RPC_CONTROL = 3,
+    RPC_EXEC_QUERY_NODE = 4
+  };
 
   std::vector<std::string> sites;
 
@@ -120,6 +129,11 @@ public:
                                  return 0;
                                });
 
+    rpc_proto.register_handler(RPC_EXEC_QUERY_NODE,
+                               [this](std::string sql, int ind) {
+                                 return rpc_exec_query_node(sql, ind);
+                               });
+
     pserver = std::make_unique<rpc::protocol<serializer>::server>(
         rpc_proto,
         ipv4_addr{"0.0.0.0", std::get<1>(config.nodes[config.name])});
@@ -136,6 +150,7 @@ public:
 
     rpc_insert_exec = rpc_proto.make_client<InsertFunc>(RPC_INSERT_DATA);
     rpc_control = rpc_proto.make_client<ControlFunc>(RPC_CONTROL);
+    rpc_remotenode = rpc_proto.make_client<RemoteNodeFunc>(RPC_EXEC_QUERY_NODE);
 
     for (auto [name, info] : config.nodes) {
       pclients.emplace(std::make_pair(
@@ -193,7 +208,29 @@ public:
   }
 
   seastar::future<std::vector<std::vector<std::string>>>
-  exec_query_node(BasicNode *node) {
+  rpc_exec_query_node(std::string sql, int nodenum) {
+    std::cout << "rpc exec query node " << sql << ' ' << nodenum << std::endl;
+    return seastar::async([this, sql, nodenum]() {
+      auto result = parseSelectStmt(sql, pdb_meta);
+      auto node = buildRawNodeTreeFromSelectStmt(result, pdb_meta);
+      pushDownAndOptimize(node.get(), {}, {}, "", pdb_meta);
+      std::vector<std::shared_ptr<BasicNode>> nodes;
+      auto copy = node->copy(pdb_meta, nodes);
+
+      // for (auto node : nodes) {
+      //   auto ptr = node.get();
+      //   std::cout << typeid(*ptr).name() << ' ';
+      // }
+      // std::cout << std::endl;
+
+      std::cout << nodes[nodenum]->to_string() << std::endl;
+
+      return exec_query_node(nodes[nodenum].get(), sql).get();
+    });
+  }
+
+  seastar::future<std::vector<std::vector<std::string>>>
+  exec_query_node(BasicNode *node, std::string sql) {
     if (node->disabled) {
       if (auto projection = dynamic_cast<ProjectionNode *>(node)) {
         return seastar::make_ready_future<
@@ -204,8 +241,14 @@ public:
             std::vector<std::vector<std::string>>>();
     }
 
+    if (node->exec_on_site.size() && node->exec_on_site != config.name &&
+        (dynamic_cast<NJoinNode *>(node) || dynamic_cast<UnionNode *>(node))) {
+      return rpc_remotenode(*pclients[node->exec_on_site], sql,
+                            node->array_index);
+    }
+
     if (auto projection = dynamic_cast<ProjectionNode *>(node)) {
-      auto result = exec_query_node(projection->child.get()).get();
+      auto result = exec_query_node(projection->child.get(), sql).get();
       std::vector<std::vector<std::string>> new_result;
       std::vector<int> keep_columns;
 
@@ -236,7 +279,7 @@ public:
       std::vector<seastar::future<std::vector<std::vector<std::string>>>> futs;
 
       for (auto ch : njoin->join_children) {
-        futs.emplace_back(std::move(exec_query_node(ch.get())));
+        futs.emplace_back(std::move(exec_query_node(ch.get(), sql)));
       }
 
       auto child_result_futs =
@@ -320,7 +363,7 @@ public:
       std::vector<seastar::future<std::vector<std::vector<std::string>>>> futs;
 
       for (auto child : union_->union_children)
-        futs.emplace_back(std::move(exec_query_node(child.get())));
+        futs.emplace_back(std::move(exec_query_node(child.get(), sql)));
 
       auto child_result_futs =
           seastar::when_all(futs.begin(), futs.end()).get();
@@ -346,7 +389,7 @@ public:
           result);
 
     } else if (auto rename = dynamic_cast<RenameNode *>(node)) {
-      auto result = exec_query_node(rename->child.get()).get();
+      auto result = exec_query_node(rename->child.get(), sql).get();
 
       for (int i = 0; i < result[0].size(); i++)
         result[0][i] = format_column_name(
@@ -598,12 +641,20 @@ public:
     auto result = parseSelectStmt(sql, pdb_meta);
     auto node = buildRawNodeTreeFromSelectStmt(result, pdb_meta);
     pushDownAndOptimize(node.get(), {}, {}, "", pdb_meta);
-    auto copy = node->copy(pdb_meta);
+    std::vector<std::shared_ptr<BasicNode>> nodes;
+    auto copy = node->copy(pdb_meta, nodes);
+    copy->optimizeExecNode(pdb_meta);
+
+    // for (auto node : nodes) {
+    //   auto ptr = node.get();
+    //   std::cout << typeid(*ptr).name() << ' ';
+    // }
+    // std::cout << std::endl;
 
     std::cout << copy->to_string() << std::endl;
 
-    return seastar::async([this, copy]() {
-      auto ret = exec_query_node(copy.get()).get();
+    return seastar::async([this, copy, sql]() {
+      auto ret = exec_query_node(copy.get(), sql).get();
       std::cout << copy->to_string() << std::endl;
       return ret;
     });
